@@ -1,53 +1,69 @@
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 import requests
+import openai
+from openai import OpenAI
+from dotenv import load_dotenv
+import os
 
+load_dotenv()
 app = Flask(__name__)
 
 # ----------------- CONFIG -----------------
 FHIR_BASE = "https://hapi.fhir.org/baseR4"
-HF_API_URL = "https://router.huggingface.co/hf-inference"
-HF_HEADERS = {}  # You can leave this empty for public/free access
 
+# Initialize OpenAI client
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # ----------------- FUNCTIONS -----------------
-def fetch_lab_results():
-    """Retrieve Observation resources (lab results)"""
-    url = f"{FHIR_BASE}/Observation?code=2339-0&_count=3"  # Glucose [mg/dL]
+def fetch_lab_results(patient_id):
+    """
+    Retrieve all Observation resources (lab results) for a specific patient.
+    """
+    url = f"{FHIR_BASE}/Observation?patient={patient_id}&_count=20"
     response = requests.get(url)
     response.raise_for_status()
     return response.json().get("entry", [])
 
 
 def sanitize_observation(obs):
-    """Simplify Observation data"""
+    """
+    Simplify Observation data into a readable format.
+    """
+    code_info = obs.get("code", {}).get("coding", [{}])[0]
     return {
-        "test_name": obs.get("code", {}).get("coding", [{}])[0].get("display", "Unknown test"),
+        "test_name": code_info.get("display", "Unknown test"),
+        "code": code_info.get("code", ""),
         "value": obs.get("valueQuantity", {}).get("value", "N/A"),
         "unit": obs.get("valueQuantity", {}).get("unit", ""),
         "status": obs.get("status", ""),
-        "effectiveDateTime": obs.get("effectiveDateTime", "")
+        "effectiveDateTime": obs.get("effectiveDateTime", ""),
     }
 
 
 def summarize_lab(obs):
-    """Use Hugging Face model to summarize a lab result"""
+    """
+    Use ChatGPT (OpenAI API) to generate a natural-language summary of the lab result.
+    """
     test = obs.get("code", {}).get("coding", [{}])[0].get("display", "Unknown test")
     value = obs.get("valueQuantity", {}).get("value", "")
     unit = obs.get("valueQuantity", {}).get("unit", "")
-    prompt = f"Explain in plain language what it means if {test} is {value}{unit}."
+    prompt = f"Explain in simple terms what it means if {test} is {value}{unit}. Keep it concise and helpful for a patient."
 
-    payload = {"inputs": prompt, "parameters": {"max_new_tokens": 80}}
     try:
-        response = requests.post(HF_API_URL, headers=HF_HEADERS, json=payload, timeout=60)
-        result = response.json()
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a medical assistant explaining lab test results to a patient in plain, kind, and accurate language."
+                },
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=80,
+        )
 
-        # Different HF models return text differently
-        if isinstance(result, list) and "generated_text" in result[0]:
-            return result[0]["generated_text"]
-        elif isinstance(result, dict) and "error" in result:
-            return f"Model error: {result['error']}"
-        else:
-            return str(result)
+        return completion.choices[0].message.content.strip()
+
     except Exception as e:
         return f"Error generating summary: {e}"
 
@@ -60,10 +76,18 @@ def home():
 
 @app.route("/labs", methods=["GET"])
 def get_labs():
+    """
+    Endpoint: /labs?patient_id=12345
+    Fetches all lab results for a given patient and summarizes them.
+    """
+    patient_id = request.args.get("patient_id", "").strip()
+    if not patient_id:
+        return jsonify({"error": "Missing required parameter: patient_id"}), 400
+
     try:
-        labs = fetch_lab_results()
+        labs = fetch_lab_results(patient_id)
         if not labs:
-            return jsonify({"error": "No lab results found."}), 404
+            return jsonify({"error": f"No lab results found for patient {patient_id}."}), 404
 
         summaries = []
         for entry in labs:
